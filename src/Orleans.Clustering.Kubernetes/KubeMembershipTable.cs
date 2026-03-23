@@ -1,572 +1,586 @@
-using k8s;
-using k8s.Models;
+using System;
+using System.IO;
+using System.Net;
+using System.Linq;
+using System.Text.Json;
+using System.Threading.Tasks;
+using System.Collections.Generic;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using Microsoft.Rest;
-using Newtonsoft.Json.Linq;
-using Orleans.Clustering.Kubernetes.Models;
-using Orleans.Configuration;
 using Orleans.Runtime;
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Net;
-using System.Text;
-using System.Threading.Tasks;
+using Orleans.Configuration;
+using Orleans.Clustering.Kubernetes.Models;
+using k8s;
+using k8s.Models;
+using k8s.Autorest;
+using Orleans.Clustering.Kubernetes.Extensions;
 
-namespace Orleans.Clustering.Kubernetes
+namespace Orleans.Clustering.Kubernetes;
+
+internal class KubeMembershipTable : IMembershipTable
 {
-    internal class KubeMembershipTable : IMembershipTable
+    private readonly ClusterOptions _clusterOptions;
+    private readonly ILogger _logger;
+    private readonly k8s.Kubernetes _kubeClient;
+    private string _namespace;
+
+    public KubeMembershipTable(ILoggerFactory loggerFactory, IOptions<ClusterOptions> clusterOptions, k8s.Kubernetes kubernetesClient)
     {
-        private readonly ClusterOptions _clusterOptions;
-        private readonly ILoggerFactory _loggerFactory;
-        private readonly ILogger _logger;
-        private readonly k8s.IKubernetes _kubeClient;
-        private string _namespace;
+        this._clusterOptions = clusterOptions.Value;
+        this._logger = loggerFactory.CreateLogger<KubeMembershipTable>();
+        this._kubeClient = kubernetesClient;
+    }
 
+    public async Task InitializeMembershipTable(bool tryInitTableVersion)
+    {
+        this._namespace = this.GetNamespace();
+        this._logger.LogInformation("Using Kubernetes namespace: {NameSpace}", this._namespace);
 
-        public KubeMembershipTable(ILoggerFactory loggerFactory, IOptions<ClusterOptions> clusterOptions, k8s.IKubernetes kubernetesClient)
+        if (tryInitTableVersion)
         {
-            this._clusterOptions = clusterOptions.Value;
-            this._loggerFactory = loggerFactory;
-            this._logger = loggerFactory?.CreateLogger<KubeMembershipTable>();
-            this._kubeClient = kubernetesClient;
+            await this.TryInitClusterVersion();
+        }
+    }
+
+    public async Task DeleteMembershipTableEntries(string clusterId)
+    {
+        var clusterVersion = await this.GetClusterVersion();
+
+        if (clusterVersion != null)
+        {
+            await this._kubeClient.DeleteNamespacedCustomObjectAsync(
+                Constants.ORLEANS_GROUP,
+                Constants.PROVIDER_MODEL_VERSION,
+                this._namespace,
+                ClusterVersionEntity.PLURAL,
+                clusterVersion.Metadata.Name);
         }
 
-        public async Task InitializeMembershipTable(bool tryInitTableVersion)
-        {
-            this._namespace = this.GetNamespace();
-            this._logger.LogInformation($"Using Kubernetes namespace: {this._namespace}.");
+        var silos = await this.GetSilos();
 
-            if (tryInitTableVersion)
-            {
-                await TryInitClusterVersion();
-            }
+        foreach (var silo in silos)
+        {
+            await this._kubeClient.DeleteNamespacedCustomObjectAsync(
+                Constants.ORLEANS_GROUP,
+                Constants.PROVIDER_MODEL_VERSION,
+                this._namespace,
+                SiloEntity.PLURAL,
+                silo.Metadata.Name);
         }
+    }
 
-        public async Task DeleteMembershipTableEntries(string clusterId)
+    public async Task<bool> InsertRow(MembershipEntry entry, TableVersion tableVersion)
+    {
+        try
         {
-            var clusterVersion = await GetClusterVersion();
+            var siloEntity = this.ConvertToEntity(entry);
+            var versionEntity = this.BuildVersionEntity(tableVersion);
 
-            if (clusterVersion != null)
+            SiloEntity existentSiloEntry = default;
+
+            try
             {
-                await this._kubeClient.DeleteNamespacedCustomObjectAsync(
-                    Constants.ORLEANS_GROUP,
-                    Constants.PROVIDER_MODEL_VERSION,
-                    this._namespace,
-                    ClusterVersionEntity.PLURAL,
-                    clusterVersion.Metadata.Name);
-            }
-
-            var silos = await GetSilos();
-
-            foreach (var silo in silos)
-            {
-                await this._kubeClient.DeleteNamespacedCustomObjectAsync(
+                existentSiloEntry = ((JsonElement) await this._kubeClient.GetNamespacedCustomObjectAsync(
                     Constants.ORLEANS_GROUP,
                     Constants.PROVIDER_MODEL_VERSION,
                     this._namespace,
                     SiloEntity.PLURAL,
-                    silo.Metadata.Name);
+                    siloEntity.Metadata.Name
+                )).Deserialize<SiloEntity>();
             }
-        }
-
-        public async Task<bool> InsertRow(MembershipEntry entry, TableVersion tableVersion)
-        {
-            try
+            catch (HttpOperationException ex)
             {
-                var siloEntity = this.ConvertToEntity(entry);
-                var versionEntity = this.BuildVersionEntity(tableVersion);
-
-                SiloEntity existentSiloEntry = default;
-
-                try
-                {
-                    existentSiloEntry = ((JObject)await this._kubeClient.GetNamespacedCustomObjectAsync(
-                        Constants.ORLEANS_GROUP,
-                        Constants.PROVIDER_MODEL_VERSION,
-                        this._namespace,
-                        SiloEntity.PLURAL,
-                        siloEntity.Metadata.Name
-                    ))?.ToObject<SiloEntity>();
-                }
-                catch (HttpOperationException ex)
-                {
-                    if (ex.Response.StatusCode != HttpStatusCode.NotFound)
-                        throw;
-                }
-
-                if (existentSiloEntry != null)
-                {
-                    return false;
-                }
-
-                var currentVersionEntity = await this.GetClusterVersion();
-
-                if (currentVersionEntity == null ||
-                    currentVersionEntity.ClusterVersion == versionEntity.ClusterVersion)
-                {
-                    return false;
-                }
-
-                var updatedVersionEntity = await this._kubeClient.ReplaceNamespacedCustomObjectAsync(
-                    versionEntity,
-                    Constants.ORLEANS_GROUP,
-                    Constants.PROVIDER_MODEL_VERSION,
-                    this._namespace,
-                    ClusterVersionEntity.PLURAL,
-                    versionEntity.Metadata.Name
-                );
-
-                if (updatedVersionEntity == null)
-                {
-                    return false;
-                }
-
-                var createdSiloEntity = await this._kubeClient.CreateNamespacedCustomObjectAsync(
-                    siloEntity,
-                    Constants.ORLEANS_GROUP,
-                    Constants.PROVIDER_MODEL_VERSION,
-                    this._namespace,
-                    SiloEntity.PLURAL
-                );
-
-                return createdSiloEntity != null;
+                if (ex.Response.StatusCode != HttpStatusCode.NotFound)
+                    throw;
             }
-            catch (InvalidOperationException)
+
+            if (existentSiloEntry != null)
             {
                 return false;
             }
-            catch (Exception exc)
-            {
-                this._logger?.LogError(exc, "Unable to insert Silo Entry.");
 
-                throw;
+            var currentVersionEntity = await this.GetClusterVersion();
+
+            if (currentVersionEntity == null ||
+                currentVersionEntity.ClusterVersion == versionEntity.ClusterVersion)
+            {
+                return false;
             }
+
+            var updatedVersionEntity = await this._kubeClient.ReplaceNamespacedCustomObjectAsync(
+                versionEntity,
+                Constants.ORLEANS_GROUP,
+                Constants.PROVIDER_MODEL_VERSION,
+                this._namespace,
+                ClusterVersionEntity.PLURAL,
+                versionEntity.Metadata.Name
+            );
+
+            if (updatedVersionEntity == null)
+            {
+                return false;
+            }
+
+            var createdSiloEntity = await this._kubeClient.CreateNamespacedCustomObjectAsync(
+                siloEntity,
+                Constants.ORLEANS_GROUP,
+                Constants.PROVIDER_MODEL_VERSION,
+                this._namespace,
+                SiloEntity.PLURAL
+            );
+
+            return createdSiloEntity != null;
         }
-
-        public async Task<MembershipTableData> ReadAll()
+        catch (InvalidOperationException)
         {
-            try
-            {
-                var versionEntity = await this.GetClusterVersion();
-                var entryEntities = await this.GetSilos();
-
-                var version = default(TableVersion);
-
-                if (versionEntity != null)
-                {
-                    version = new TableVersion(versionEntity.ClusterVersion, versionEntity.Metadata.ResourceVersion);
-                }
-                else
-                {
-                    this._logger?.LogError("Initial ClusterVersionEntity entity doesn't exist.");
-                }
-
-                var memEntries = new List<Tuple<MembershipEntry, string>>();
-
-                foreach (var entity in entryEntities)
-                {
-                    try
-                    {
-                        MembershipEntry membershipEntry = ParseEntity(entity);
-
-                        memEntries.Add(new Tuple<MembershipEntry, string>(membershipEntry, entity.Metadata.ResourceVersion));
-                    }
-                    catch (Exception exc)
-                    {
-                        this._logger?.LogWarning(exc, "Failure reading all membership records from Kubernetes");
-
-                        throw;
-                    }
-                }
-
-                var data = new MembershipTableData(memEntries, version);
-
-                return data;
-            }
-            catch (Exception exc)
-            {
-                this._logger?.LogWarning(exc, "Failure reading all silo entries for cluster id {clusterId}", this._clusterOptions.ClusterId);
-
-                throw;
-            }
+            return false;
         }
-
-        public async Task<MembershipTableData> ReadRow(SiloAddress key)
+        catch (Exception exc)
         {
-            var name = ConstructSiloEntityId(key);
+            _logger?.LogError(exc, "Unable to insert Silo Entry");
+            throw;
+        }
+    }
 
-            try
+    public async Task<MembershipTableData> ReadAll()
+    {
+        try
+        {
+            var versionEntity = await this.GetClusterVersion();
+            var entryEntities = await this.GetSilos();
+
+            var version = default(TableVersion);
+
+            if (versionEntity != null)
             {
-                var versionEntity = await this.GetClusterVersion();
-                SiloEntity entity = default;
+                version = new TableVersion(versionEntity.ClusterVersion, versionEntity.Metadata.ResourceVersion);
+            }
+            else
+            {
+                this._logger?.LogError("Initial ClusterVersionEntity entity doesn't exist");
+            }
 
+            var memEntries = new List<Tuple<MembershipEntry, string>>();
+
+            foreach (var entity in entryEntities)
+            {
                 try
                 {
-                    entity = ((JObject)await this._kubeClient.GetNamespacedCustomObjectAsync(
-                        Constants.ORLEANS_GROUP,
-                        Constants.PROVIDER_MODEL_VERSION,
-                        this._namespace,
-                        SiloEntity.PLURAL,
-                        name
-                    ))?.ToObject<SiloEntity>();
-                }
-                catch (HttpOperationException ex)
-                {
-                    if (ex.Response.StatusCode != HttpStatusCode.NotFound)
-                        throw;
-                }
-
-                var version = default(TableVersion);
-
-                if (versionEntity != null)
-                {
-                    version = new TableVersion(versionEntity.ClusterVersion, versionEntity.Metadata.ResourceVersion);
-                }
-                else
-                {
-                    this._logger?.LogError("Initial ClusterVersionEntity entity doesn't exist.");
-                }
-
-                var memEntries = new List<Tuple<MembershipEntry, string>>();
-
-                if (entity != null)
-                {
-                    var membershipEntry = ParseEntity(entity);
+                    MembershipEntry membershipEntry = ParseEntity(entity);
 
                     memEntries.Add(new Tuple<MembershipEntry, string>(membershipEntry, entity.Metadata.ResourceVersion));
                 }
-
-                var data = new MembershipTableData(memEntries, version);
-
-                return data;
-            }
-            catch (Exception exc)
-            {
-                this._logger?.LogError(exc, "Failure reading silo entry {name} for cluster id {clusterId}.", name, this._clusterOptions.ClusterId);
-
-                throw;
-            }
-        }
-
-        public async Task UpdateIAmAlive(MembershipEntry entry)
-        {
-            var name = ConstructSiloEntityId(entry.SiloAddress);
-
-            try
-            {
-                SiloEntity siloEntity = default;
-
-                try
+                catch (Exception exc)
                 {
-                    siloEntity = ((JObject)await this._kubeClient.GetNamespacedCustomObjectAsync(
-                        Constants.ORLEANS_GROUP,
-                        Constants.PROVIDER_MODEL_VERSION,
-                        this._namespace,
-                        SiloEntity.PLURAL,
-                        name
-                    ))?.ToObject<SiloEntity>();
-                }
-                catch (HttpOperationException ex)
-                {
-                    if (ex.Response.StatusCode == HttpStatusCode.NotFound)
-                        throw new InvalidOperationException($"Unable to find silo entry {name}.");
+                    this._logger?.LogWarning(exc, "Failure reading all membership records from Kubernetes");
 
                     throw;
                 }
+            }
 
-                siloEntity.IAmAliveTime = entry.IAmAliveTime;
+            var data = new MembershipTableData(memEntries, version);
 
-                await this._kubeClient.ReplaceNamespacedCustomObjectAsync(
-                    siloEntity,
+            return data;
+        }
+        catch (Exception exc)
+        {
+            this._logger?.LogWarning(exc, "Failure reading all silo entries for cluster id {ClusterId}", this._clusterOptions.ClusterId);
+
+            throw;
+        }
+    }
+
+    public async Task<MembershipTableData> ReadRow(SiloAddress key)
+    {
+        var name = ConstructSiloEntityId(key);
+
+        try
+        {
+            var versionEntity = await this.GetClusterVersion();
+            SiloEntity entity = default;
+
+            try
+            {
+                entity = ((JsonElement) await this._kubeClient.GetNamespacedCustomObjectAsync(
                     Constants.ORLEANS_GROUP,
                     Constants.PROVIDER_MODEL_VERSION,
                     this._namespace,
                     SiloEntity.PLURAL,
-                    siloEntity.Metadata.Name
-                );
+                    name
+                )).Deserialize<SiloEntity>();
             }
-            catch (Exception exc)
+            catch (HttpOperationException ex)
             {
-                this._logger?.LogError(exc, "Unable to update Silo Entry {name}.", name);
+                if (ex.Response.StatusCode != HttpStatusCode.NotFound)
+                    throw;
+            }
+
+            var version = default(TableVersion);
+
+            if (versionEntity != null)
+            {
+                version = new TableVersion(versionEntity.ClusterVersion, versionEntity.Metadata.ResourceVersion);
+            }
+            else
+            {
+                this._logger?.LogError("Initial ClusterVersionEntity entity doesn't exist");
+            }
+
+            var memEntries = new List<Tuple<MembershipEntry, string>>();
+
+            if (entity != null)
+            {
+                var membershipEntry = ParseEntity(entity);
+
+                memEntries.Add(new Tuple<MembershipEntry, string>(membershipEntry, entity.Metadata.ResourceVersion));
+            }
+
+            var data = new MembershipTableData(memEntries, version);
+
+            return data;
+        }
+        catch (Exception exc)
+        {
+            this._logger?.LogError(exc, "Failure reading silo entry {Name} for cluster id {ClusterId}", name, this._clusterOptions.ClusterId);
+
+            throw;
+        }
+    }
+
+    public async Task UpdateIAmAlive(MembershipEntry entry)
+    {
+        var name = ConstructSiloEntityId(entry.SiloAddress);
+
+        try
+        {
+            SiloEntity siloEntity;
+
+            try
+            {
+                siloEntity = ((JsonElement) await this._kubeClient.GetNamespacedCustomObjectAsync(
+                    Constants.ORLEANS_GROUP,
+                    Constants.PROVIDER_MODEL_VERSION,
+                    this._namespace,
+                    SiloEntity.PLURAL,
+                    name
+                )).Deserialize<SiloEntity>();
+            }
+            catch (HttpOperationException ex)
+            {
+                if (ex.Response.StatusCode == HttpStatusCode.NotFound)
+                    throw new InvalidOperationException($"Unable to find silo entry {name}.");
 
                 throw;
             }
-        }
 
-        public async Task<bool> UpdateRow(MembershipEntry entry, string etag, TableVersion tableVersion)
+            siloEntity.IAmAliveTime = entry.IAmAliveTime;
+
+            await this._kubeClient.ReplaceNamespacedCustomObjectAsync(
+                siloEntity,
+                Constants.ORLEANS_GROUP,
+                Constants.PROVIDER_MODEL_VERSION,
+                this._namespace,
+                SiloEntity.PLURAL,
+                siloEntity.Metadata.Name
+            );
+        }
+        catch (Exception exc)
         {
+            this._logger?.LogError(exc, "Unable to update Silo Entry {Name}", name);
+
+            throw;
+        }
+    }
+
+    public async Task<bool> UpdateRow(MembershipEntry entry, string etag, TableVersion tableVersion)
+    {
+        try
+        {
+            var siloEntity = this.ConvertToEntity(entry);
+
+            siloEntity.Metadata.ResourceVersion = etag;
+
+            var versionEntity = this.BuildVersionEntity(tableVersion);
+
+            var currentVersionEntity = await this.GetClusterVersion();
+
+            if (currentVersionEntity == null ||
+                currentVersionEntity.ClusterVersion == versionEntity.ClusterVersion)
+            {
+                return false;
+            }
+
+            var updatedVersionEntity = await this._kubeClient.ReplaceNamespacedCustomObjectAsync(
+                versionEntity,
+                Constants.ORLEANS_GROUP,
+                Constants.PROVIDER_MODEL_VERSION,
+                this._namespace,
+                ClusterVersionEntity.PLURAL,
+                versionEntity.Metadata.Name
+            );
+
+            if (updatedVersionEntity == null)
+            {
+                return false;
+            }
+
+            var updated = await this._kubeClient.ReplaceNamespacedCustomObjectAsync(
+                siloEntity,
+                Constants.ORLEANS_GROUP,
+                Constants.PROVIDER_MODEL_VERSION,
+                this._namespace,
+                SiloEntity.PLURAL,
+                siloEntity.Metadata.Name
+            );
+
+            return updated != null;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+        catch (Exception exc)
+        {
+            this._logger?.LogError(exc, "Unable to update Silo Entry");
+
+            throw;
+        }
+    }
+
+    private string GetSiloObjectDefinitionName() => $"{SiloEntity.PLURAL}.{Constants.ORLEANS_GROUP}";
+
+    private string GetClusterVersionObjectDefinitionName() => $"{ClusterVersionEntity.PLURAL}.{Constants.ORLEANS_GROUP}";
+
+    private async Task TryInitClusterVersion()
+    {
+        try
+        {
+            ClusterVersionEntity version = default;
+
             try
             {
-                var siloEntity = this.ConvertToEntity(entry);
-
-                siloEntity.Metadata.ResourceVersion = etag;
-
-                var versionEntity = this.BuildVersionEntity(tableVersion);
-
-                var currentVersionEntity = await this.GetClusterVersion();
-
-                if (currentVersionEntity == null ||
-                    currentVersionEntity.ClusterVersion == versionEntity.ClusterVersion)
-                {
-                    return false;
-                }
-
-                var updatedVersionEntity = await this._kubeClient.ReplaceNamespacedCustomObjectAsync(
-                    versionEntity,
+                version = ((JsonElement)await this._kubeClient.GetNamespacedCustomObjectAsync(
                     Constants.ORLEANS_GROUP,
                     Constants.PROVIDER_MODEL_VERSION,
                     this._namespace,
                     ClusterVersionEntity.PLURAL,
-                    versionEntity.Metadata.Name
-                );
-
-                if (updatedVersionEntity == null)
+                    this._clusterOptions.ClusterId
+                )).Deserialize<ClusterVersionEntity>();
+            }
+            catch (HttpOperationException ex)
+            {
+                if (ex.Response.StatusCode != HttpStatusCode.NotFound)
                 {
-                    return false;
+                    this._logger.LogError(ex, "Unable to initialize cluster version: {ExMessage}", ex.Message);
+                    throw;
                 }
+            }
 
-                var updated = await this._kubeClient.ReplaceNamespacedCustomObjectAsync(
-                    siloEntity,
+            if (version == null)
+            {
+                version = new ClusterVersionEntity
+                {
+                    ClusterId = this._clusterOptions.ClusterId,
+                    ClusterVersion = 0,
+                    ApiVersion = $"{Constants.ORLEANS_GROUP}/{Constants.PROVIDER_MODEL_VERSION}",
+                    Metadata = new V1ObjectMeta { Name = this._clusterOptions.ClusterId }
+                };
+
+                var created = ((JsonElement)await this._kubeClient.CreateNamespacedCustomObjectAsync(
+                    version,
                     Constants.ORLEANS_GROUP,
                     Constants.PROVIDER_MODEL_VERSION,
                     this._namespace,
-                    SiloEntity.PLURAL,
-                    siloEntity.Metadata.Name
-                );
+                    ClusterVersionEntity.PLURAL
+                )).Deserialize<ClusterVersionEntity>();
 
-                return updated != null;
+                if (created != null)
+                {
+                    this._logger?.LogInformation("Created new Cluster Version entity for Cluster {ClusterId}",
+                        this._clusterOptions.ClusterId);
+                }
             }
-            catch (InvalidOperationException)
+            else
             {
-                return false;
-            }
-            catch (Exception exc)
-            {
-                this._logger?.LogError(exc, "Unable to update Silo Entry.");
-
-                throw;
+                this._logger?.LogInformation("Cluster {ClusterId} already exists. Trying to join it",
+                    this._clusterOptions.ClusterId);
             }
         }
-
-        private string GetSiloObjectDefinitionName() => $"{SiloEntity.PLURAL}.{Constants.ORLEANS_GROUP}";
-
-        private string GetClusterVersionObjectDefinitionName() => $"{ClusterVersionEntity.PLURAL}.{Constants.ORLEANS_GROUP}";
-
-        private async Task TryInitClusterVersion()
+        catch (HttpOperationException exception)
         {
-            try
-            {
-                ClusterVersionEntity version = default;
-
-                try
-                {
-                    version = ((JObject)await this._kubeClient.GetNamespacedCustomObjectAsync(
-                        Constants.ORLEANS_GROUP,
-                        Constants.PROVIDER_MODEL_VERSION,
-                        this._namespace,
-                        ClusterVersionEntity.PLURAL,
-                        this._clusterOptions.ClusterId
-                    ))?.ToObject<ClusterVersionEntity>();
-                }
-                catch (HttpOperationException ex)
-                {
-                    if (ex.Response.StatusCode != HttpStatusCode.NotFound)
-                    {
-                        this._logger.LogError(ex, $"Unable to initialize cluster version: {ex.Message}.");
-                        throw;
-                    }
-                }
-
-                if (version == null)
-                {
-                    version = new ClusterVersionEntity
-                    {
-                        ClusterId = this._clusterOptions.ClusterId,
-                        ClusterVersion = 0,
-                        ApiVersion = $"{Constants.ORLEANS_GROUP}/{Constants.PROVIDER_MODEL_VERSION}",
-                        Metadata = new V1ObjectMeta { Name = this._clusterOptions.ClusterId }
-                    };
-
-                    var created = ((JObject)await this._kubeClient.CreateNamespacedCustomObjectAsync(
-                        version,
-                        Constants.ORLEANS_GROUP,
-                        Constants.PROVIDER_MODEL_VERSION,
-                        this._namespace,
-                        ClusterVersionEntity.PLURAL
-                    ))?.ToObject<ClusterVersionEntity>();
-
-                    if (created != null)
-                    {
-                        this._logger?.Info("Created new Cluster Version entity for Cluster {clusterId}.", this._clusterOptions.ClusterId);
-                    }
-                }
-                else
-                {
-                    this._logger?.Info("Cluster {clusterId} already exists. Trying to join it.", this._clusterOptions.ClusterId);
-                }
-            }
-            catch (Exception exc)
-            {
-                // TODO: Handle conflicts better when the schema is already deployed
-                this._logger?.LogWarning(exc, "We tried to Initialize ClusterVersion but fail. Ignoring for now...");
-            }
+            this._logger?.LogWarning(exception, "Failed to initialize ClusterVersion: {details}", exception.GetServerResponse());
         }
-
-        private async Task<ClusterVersionEntity> GetClusterVersion()
+        catch (Exception exc)
         {
-            var versions = ((JObject)await this._kubeClient.ListNamespacedCustomObjectAsync(
+            // TODO: Handle conflicts better when the schema is already deployed
+            this._logger?.LogWarning(exc, "We tried to Initialize ClusterVersion but fail. Ignoring for now...");
+        }
+    }
+
+    private async Task<ClusterVersionEntity> GetClusterVersion()
+    {
+        var versionsContainer = (JsonElement)await this._kubeClient.ListNamespacedCustomObjectAsync(
                 Constants.ORLEANS_GROUP,
                 Constants.PROVIDER_MODEL_VERSION,
-                this._namespace, ClusterVersionEntity.PLURAL)
-            )?["items"]?.ToObject<ClusterVersionEntity[]>();
+                this._namespace, ClusterVersionEntity.PLURAL);
 
-            if (versions == null) return null;
-
-            return versions.FirstOrDefault(v => v.ClusterId == this._clusterOptions.ClusterId &&
-                v.Metadata.Name == this._clusterOptions.ClusterId);
+        if (versionsContainer.TryGetProperty("items", out var items) is false)
+        {
+            return null;
         }
 
-        private async Task<IReadOnlyList<SiloEntity>> GetSilos()
-        {
-            var silos = ((JObject)await this._kubeClient.ListNamespacedCustomObjectAsync(
+        var versions = items.Deserialize<ClusterVersionEntity[]>();
+
+        if (versions == null) return null;
+
+        return versions.FirstOrDefault(v => v.ClusterId == this._clusterOptions.ClusterId &&
+                                            v.Metadata.Name == this._clusterOptions.ClusterId);
+    }
+
+    private async Task<IReadOnlyList<SiloEntity>> GetSilos()
+    {
+        var silosContainer = (JsonElement)await this._kubeClient.ListNamespacedCustomObjectAsync(
                 Constants.ORLEANS_GROUP,
                 Constants.PROVIDER_MODEL_VERSION,
-                this._namespace, SiloEntity.PLURAL)
-            )?["items"]?.ToObject<SiloEntity[]>();
+                this._namespace, SiloEntity.PLURAL);
 
-            return silos.Where(s => s.ClusterId == this._clusterOptions.ClusterId).ToList();
-        }
-
-        private static MembershipEntry ParseEntity(SiloEntity entity)
+        if (silosContainer.TryGetProperty("items", out var items) is false)
         {
-            var entry = new MembershipEntry
-            {
-                HostName = entity.Hostname,
-                Status = entity.Status
-            };
-
-            if (entity.ProxyPort.HasValue)
-                entry.ProxyPort = entity.ProxyPort.Value;
-
-            entry.SiloAddress = SiloAddress.New(new IPEndPoint(IPAddress.Parse(entity.Address), entity.Port), entity.Generation);
-
-            entry.SiloName = entity.SiloName;
-
-            entry.StartTime = entity.StartTime.UtcDateTime;
-
-            entry.IAmAliveTime = entity.IAmAliveTime.UtcDateTime;
-
-            var suspectingSilos = new List<SiloAddress>();
-            var suspectingTimes = new List<DateTime>();
-
-            foreach (var silo in entity.SuspectingSilos)
-            {
-                suspectingSilos.Add(SiloAddress.FromParsableString(silo));
-            }
-
-            foreach (var time in entity.SuspectingTimes)
-            {
-                suspectingTimes.Add(LogFormatter.ParseDate(time));
-            }
-
-            if (suspectingSilos.Count != suspectingTimes.Count)
-            {
-                throw new OrleansException($"SuspectingSilos.Length of {suspectingSilos.Count} as read from Kubernetes is not equal to SuspectingTimes.Length of {suspectingTimes.Count}");
-            }
-
-            for (int i = 0; i < suspectingSilos.Count; i++)
-            {
-                entry.AddSuspector(suspectingSilos[i], suspectingTimes[i]);
-            }
-
-            return entry;
+            return Array.Empty<SiloEntity>();
         }
 
-        private SiloEntity ConvertToEntity(MembershipEntry membershipEntry)
+        return items
+            .Deserialize<SiloEntity[]>()
+            .Where(s => s.ClusterId == this._clusterOptions.ClusterId)
+            .ToList();
+    }
+
+    private static MembershipEntry ParseEntity(SiloEntity entity)
+    {
+        var entry = new MembershipEntry
         {
-            var tableEntry = new SiloEntity
-            {
-                Metadata = new V1ObjectMeta { Name = ConstructSiloEntityId(membershipEntry.SiloAddress) },
-                ClusterId = this._clusterOptions.ClusterId,
-                Address = membershipEntry.SiloAddress.Endpoint.Address.ToString(),
-                Port = membershipEntry.SiloAddress.Endpoint.Port,
-                Generation = membershipEntry.SiloAddress.Generation,
-                Hostname = membershipEntry.HostName,
-                Status = membershipEntry.Status,
-                ProxyPort = membershipEntry.ProxyPort,
-                SiloName = membershipEntry.SiloName,
-                StartTime = membershipEntry.StartTime,
-                IAmAliveTime = membershipEntry.IAmAliveTime,
-                Kind = SiloEntity.KIND,
-                ApiVersion = $"{Constants.ORLEANS_GROUP}/{Constants.PROVIDER_MODEL_VERSION}",
-            };
+            HostName = entity.Hostname,
+            Status = entity.Status
+        };
 
-            if (membershipEntry.SuspectTimes != null)
+        if (entity.ProxyPort.HasValue)
+            entry.ProxyPort = entity.ProxyPort.Value;
+
+        entry.SiloAddress = SiloAddress.New(new IPEndPoint(IPAddress.Parse(entity.Address), entity.Port), entity.Generation);
+
+        entry.SiloName = entity.SiloName;
+
+        entry.StartTime = entity.StartTime.UtcDateTime;
+
+        entry.IAmAliveTime = entity.IAmAliveTime.UtcDateTime;
+
+        var suspectingSilos = new List<SiloAddress>();
+        var suspectingTimes = new List<DateTime>();
+
+        foreach (var silo in entity.SuspectingSilos)
+        {
+            suspectingSilos.Add(SiloAddress.FromParsableString(silo));
+        }
+
+        foreach (var time in entity.SuspectingTimes)
+        {
+            suspectingTimes.Add(LogFormatter.ParseDate(time));
+        }
+
+        if (suspectingSilos.Count != suspectingTimes.Count)
+        {
+            throw new OrleansException($"SuspectingSilos.Length of {suspectingSilos.Count} as read from Kubernetes is not equal to SuspectingTimes.Length of {suspectingTimes.Count}");
+        }
+
+        for (int i = 0; i < suspectingSilos.Count; i++)
+        {
+            entry.AddSuspector(suspectingSilos[i], suspectingTimes[i]);
+        }
+
+        return entry;
+    }
+
+    private SiloEntity ConvertToEntity(MembershipEntry membershipEntry)
+    {
+        var tableEntry = new SiloEntity
+        {
+            Metadata = new V1ObjectMeta { Name = ConstructSiloEntityId(membershipEntry.SiloAddress) },
+            ClusterId = this._clusterOptions.ClusterId,
+            Address = membershipEntry.SiloAddress.Endpoint.Address.ToString(),
+            Port = membershipEntry.SiloAddress.Endpoint.Port,
+            Generation = membershipEntry.SiloAddress.Generation,
+            Hostname = membershipEntry.HostName,
+            Status = membershipEntry.Status,
+            ProxyPort = membershipEntry.ProxyPort,
+            SiloName = membershipEntry.SiloName,
+            StartTime = membershipEntry.StartTime,
+            IAmAliveTime = membershipEntry.IAmAliveTime,
+            Kind = SiloEntity.KIND,
+            ApiVersion = $"{Constants.ORLEANS_GROUP}/{Constants.PROVIDER_MODEL_VERSION}",
+        };
+
+        if (membershipEntry.SuspectTimes != null)
+        {
+            foreach (var tuple in membershipEntry.SuspectTimes)
             {
-                foreach (var tuple in membershipEntry.SuspectTimes)
-                {
-                    tableEntry.SuspectingSilos.Add(tuple.Item1.ToParsableString());
-                    tableEntry.SuspectingTimes.Add(LogFormatter.PrintDate(tuple.Item2));
-                }
+                tableEntry.SuspectingSilos.Add(tuple.Item1.ToParsableString());
+                tableEntry.SuspectingTimes.Add(LogFormatter.PrintDate(tuple.Item2));
             }
-
-            return tableEntry;
         }
 
-        private ClusterVersionEntity BuildVersionEntity(TableVersion tableVersion)
+        return tableEntry;
+    }
+
+    private ClusterVersionEntity BuildVersionEntity(TableVersion tableVersion)
+    {
+        return new ClusterVersionEntity
         {
-            return new ClusterVersionEntity
+            ClusterId = this._clusterOptions.ClusterId,
+            ClusterVersion = tableVersion.Version,
+            Metadata = new V1ObjectMeta
             {
-                ClusterId = this._clusterOptions.ClusterId,
-                ClusterVersion = tableVersion.Version,
-                Metadata = new V1ObjectMeta
-                {
-                    Name = this._clusterOptions.ClusterId,
-                    ResourceVersion = tableVersion.VersionEtag
-                },
-                Kind = ClusterVersionEntity.KIND,
-                ApiVersion = $"{Constants.ORLEANS_GROUP}/{Constants.PROVIDER_MODEL_VERSION}",
-            };
-        }
+                Name = this._clusterOptions.ClusterId,
+                ResourceVersion = tableVersion.VersionEtag
+            },
+            Kind = ClusterVersionEntity.KIND,
+            ApiVersion = $"{Constants.ORLEANS_GROUP}/{Constants.PROVIDER_MODEL_VERSION}",
+        };
+    }
 
-        private static string ConstructSiloEntityId(SiloAddress silo) => $"{silo.Endpoint.Address}-{silo.Endpoint.Port}-{silo.Generation}";
+    private static string ConstructSiloEntityId(SiloAddress silo) => $"{silo.Endpoint.Address}-{silo.Endpoint.Port}-{silo.Generation}";
 
-        public async Task CleanupDefunctSiloEntries(DateTimeOffset beforeDate)
+    public async Task CleanupDefunctSiloEntries(DateTimeOffset beforeDate)
+    {
+        var allSilos = await this.GetSilos();
+        if (allSilos.Count == 0) return;
+
+        var toDelete = allSilos.Where(s => s.Status == SiloStatus.Dead && s.IAmAliveTime < beforeDate);
+
+        foreach (var deadSilo in toDelete)
         {
-            var allSilos = await this.GetSilos();
-            if (allSilos.Count == 0) return;
-
-            var toDelete = allSilos.Where(s => s.Status == SiloStatus.Dead && s.IAmAliveTime < beforeDate);
-
-            foreach (var deadSilo in toDelete)
-            {
-                await this._kubeClient.DeleteNamespacedCustomObjectAsync(
-                    Constants.ORLEANS_GROUP,
-                    Constants.PROVIDER_MODEL_VERSION,
-                    this._namespace,
-                    SiloEntity.PLURAL,
-                    deadSilo.Metadata.Name
-                );
-            }
+            await this._kubeClient.DeleteNamespacedCustomObjectAsync(
+                Constants.ORLEANS_GROUP,
+                Constants.PROVIDER_MODEL_VERSION,
+                this._namespace,
+                SiloEntity.PLURAL,
+                deadSilo.Metadata.Name
+            );
         }
+    }
 
-        private string GetNamespace()
-        {
-            var namespaceFilePath = Path.Combine(Constants.SERVICE_ACCOUNT_PATH, Constants.SERVICE_ACCOUNT_NAMESPACE_FILENAME);
-            if (!File.Exists(namespaceFilePath)) return Constants.ORLEANS_NAMESPACE;
+    private string GetNamespace()
+    {
+        var namespaceFilePath = Path.Combine(Constants.SERVICE_ACCOUNT_PATH, Constants.SERVICE_ACCOUNT_NAMESPACE_FILENAME);
+        if (!File.Exists(namespaceFilePath)) return Constants.ORLEANS_NAMESPACE;
 
-            var ns = File.ReadAllText(namespaceFilePath);
+        var ns = File.ReadAllText(namespaceFilePath);
 
-            if (!string.IsNullOrWhiteSpace(ns)) return ns;
+        if (!string.IsNullOrWhiteSpace(ns)) return ns;
 
-            this._logger?.LogWarning(
-                "Namespace file {namespaceFilePath} wasn't found. Are we running in a pod? If you are running unit tests outside a pod, please create the test namespace '{namespace}'.",
-                namespaceFilePath, Constants.ORLEANS_NAMESPACE);
+        this._logger?.LogWarning(
+            "Namespace file {NamespaceFilePath} wasn't found. Are we running in a pod? If you are running unit tests outside a pod, please create the test namespace '{Namespace}'",
+            namespaceFilePath, Constants.ORLEANS_NAMESPACE);
 
-            return Constants.ORLEANS_NAMESPACE;
-        }
+        return Constants.ORLEANS_NAMESPACE;
     }
 }
